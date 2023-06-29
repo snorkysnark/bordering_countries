@@ -1,131 +1,98 @@
 # %%
+import polars as pl  # Better than pandas
+from SPARQLWrapper import SPARQLWrapper, JSON as JsonReturn
 from tqdm import tqdm
-import requests
-
-# Better than pandas
-import polars as pl
-
 
 # %%
-def wbsearchentities(name: str):
-    response = requests.get(
-        "https://www.wikidata.org/w/api.php",
-        params={
-            "action": "wbsearchentities",
-            "search": name,
-            "language": "en",
-            "format": "json",
-        },
-    )
-    response.raise_for_status()
-    return response.json()
-
+pl.Config.set_fmt_str_lengths(100)
 
 # %%
-def load_entity(id: str):
-    response = requests.get(
-        "https://www.wikidata.org/w/rest.php/wikibase/v0/entities/items/" + id
-    )
-    response.raise_for_status()
-    return response.json()
 
-
-# %%
-countries = (
-    pl.scan_csv("./landlocked 2023-06-26 - Лист1.csv")
+input_countries = (
+    pl.scan_csv("./data/landlocked 2023-06-26 - Лист1.csv")
     .select(pl.col("landlocked country").alias("name"))
     .collect()
+    .to_series()
+    .to_list()
 )
-countries
+input_countries
+
 
 # %%
-search_results_by_name = {}
-for name in tqdm(countries["name"], total=len(countries)):
-    search_results_by_name[name] = wbsearchentities(name)
+class WikidataRequests:
+    def __init__(self) -> None:
+        self.sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
+        self.sparql.setReturnFormat(JsonReturn)
 
-# Cache
-# %store search_results_by_name
-# %%
-# Load from cache
-# %store -r search_results_by_name
-# %%
-countries = countries.with_columns(
-    pl.col("name")
-    .apply(lambda name: search_results_by_name[name]["search"][0]["id"])
-    .alias("code")
-)
-countries
+    def query(self, query: str, schema=None):
+        self.sparql.setQuery(query)
+        result: dict = self.sparql.queryAndConvert()  # type:ignore
 
-# %%
-entity_by_code = {}
-for code in tqdm(countries["code"], total=len(countries)):
-    entity_by_code[code] = load_entity(code)
-
-
-# Cache
-# %store entity_by_code
-# %%
-# Load from cache
-# %store -r entity_by_code
-# %%
-def property_values(entity: dict, prop_name: str):
-    return list(
-        map(lambda prop: prop["value"]["content"], entity["statements"][prop_name])
-    )
-
-
-# Property:P47 - shares border with
-bordering = (
-    countries.select("code")
-    .with_columns(
-        pl.col("code")
-        .apply(lambda code: property_values(entity_by_code[code], "P47"))
-        .alias("bordering_code")
-    )
-    .explode("bordering_code")
-)
-bordering
-# %%
-names_not_found = bordering.join(
-    countries, left_on="bordering_code", right_on="code", how="left"
-).filter(pl.col("name").is_null())
-
-for code in tqdm(names_not_found["bordering_code"], total=len(names_not_found)):
-    entity_by_code[code] = load_entity(code)
-
-
-# Cache
-# %store entity_by_code
-# %%
-# Property:P31 - instance of
-# Q6256 - country
-def is_country(entity: dict):
-    for instance_of in entity["statements"].get("P31", []):
-        if instance_of["value"]["content"] == "Q6256":
-            return True
-    return False
-
-
-countries = (
-    pl.Series(
-        values=list(
-            map(
-                lambda item: {"name": item[1]["labels"]["en"], "code": item[0]},
-                filter(
-                    lambda item: is_country(item[1]),
-                    entity_by_code.items(),
-                ),
-            )
+        return pl.DataFrame(result["results"]["bindings"], schema=schema).select(
+            pl.col("*").apply(lambda var: var["value"])
         )
+
+    def find_country(self, name: str):
+        return self.query(
+            f"""\
+SELECT ?country ?countryLabel ?countryDescription WHERE {{
+    ?country rdfs:label "{name}"@en;
+        wdt:P31 wd:Q3624078. # 'instance of' 'sovereign state'
+    FILTER(NOT EXISTS {{ ?country (p:P31/ps:P31) wd:Q3024240. }}) # is NOT a 'historical country'
+    SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}}
+LIMIT 1""",
+            schema=["country", "countryLabel", "countryDescription"],
+        )
+
+    def find_bordering(self, id: str):
+        return self.query(
+            f"""\
+SELECT ?bordering ?borderingLabel WHERE {{
+    ?bordering wdt:P31 wd:Q3624078. # 'instance of' 'sovereign state'
+    ?bordering wdt:P47 wd:{id}. # 'shares border with'
+    FILTER(NOT EXISTS {{ ?bordering (p:P31/ps:P31) wd:Q3024240. }}) # is NOT a 'historical country'
+    SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}}""",
+            schema=["bordering", "borderingLabel"],
+        )
+
+
+wikidata = WikidataRequests()
+
+
+# %%
+def find_countries(countries):
+    dfs = []
+    for country in tqdm(countries, total=len(countries)):
+        dfs.append(wikidata.find_country(country))
+    return pl.DataFrame({"query": countries}).join(
+        pl.concat(dfs), left_on="query", right_on="countryLabel", how="left"
     )
-    .to_frame("a")
-    .unnest("a")
-)
-countries
+
+
 # %%
-final = countries.join(bordering, on="code").join(
-    countries, left_on="bordering_code", right_on="code"
-)
-final
+found_countries = find_countries(input_countries)
+found_countries
+
+
 # %%
-final.write_csv("bordering.csv")
+print(
+    "Found",
+    len(found_countries.filter(pl.col("country").is_not_null())),
+    "/",
+    len(found_countries),
+)
+
+
+# %%
+def extract_id(uri: str):
+    return uri.rsplit("/", 1)[1]
+
+
+found_countries.with_columns(pl.col("country").apply(extract_id).alias("id"))
+# %%
+b = wikidata.find_bordering("Q403")
+b
+# %%
+b.with_columns(pl.lit("Q403").alias("id"))
