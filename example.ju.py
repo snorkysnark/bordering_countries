@@ -82,7 +82,7 @@ def find_countries(countries):
 country_codes = find_countries(input_countries)
 print(
     "Found",
-    len(country_codes.filter(pl.col("label").is_not_null())),
+    len(country_codes.filter(pl.col("uri").is_not_null())),
     "/",
     len(country_codes),
 )
