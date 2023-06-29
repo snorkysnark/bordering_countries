@@ -86,6 +86,46 @@ bordering = (
 )
 bordering
 # %%
-countries.join(bordering, on="code").join(
+names_not_found = bordering.join(
     countries, left_on="bordering_code", right_on="code", how="left"
-).rename({"name_right": "bordering_name"})
+).filter(pl.col("name").is_null())
+
+for code in tqdm(names_not_found["bordering_code"], total=len(names_not_found)):
+    entity_by_code[code] = load_entity(code)
+
+
+# Cache
+# %store entity_by_code
+# %%
+# Property:P31 - instance of
+# Q6256 - country
+def is_country(entity: dict):
+    for instance_of in entity["statements"].get("P31", []):
+        if instance_of["value"]["content"] == "Q6256":
+            return True
+    return False
+
+
+countries = (
+    pl.Series(
+        values=list(
+            map(
+                lambda item: {"name": item[1]["labels"]["en"], "code": item[0]},
+                filter(
+                    lambda item: is_country(item[1]),
+                    entity_by_code.items(),
+                ),
+            )
+        )
+    )
+    .to_frame("a")
+    .unnest("a")
+)
+countries
+# %%
+final = countries.join(bordering, on="code").join(
+    countries, left_on="bordering_code", right_on="code"
+)
+final
+# %%
+final.write_csv("bordering.csv")
